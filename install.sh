@@ -6,13 +6,13 @@
 # only to place the checked payload into privileged directories.
 set -eu
 
-VERSION=2.0.0
+VERSION=2.1.0
 INSTALL_DIR=${UPDATE_INSTALL_DIR:-/usr/local/bin}
 CONFIG_DIR=${UPDATE_CONFIG_DIR:-/etc/update}
 DEST=$INSTALL_DIR/update
 ALLOWLIST=$CONFIG_DIR/compose-projects
 LEGACY_ALLOWLIST=$CONFIG_DIR/compose-dirs
-PAYLOAD_SHA256=83ad42b073711e10e03db2074eef1ed283a86859d1c5183a4bc1b209ecf7338a
+PAYLOAD_SHA256=bce2c32e138c863b314f0f4aba57ab2a9a16e7e52f86e27df48c2195af4d6b3b
 STAGE=
 WORKDIR=
 
@@ -67,7 +67,7 @@ cat > "$PAYLOAD" <<'__UPDATE_PAYLOAD_75B3A1__'
 # Requires: POSIX /bin/sh. Does not reboot, prune Docker, or change OS releases.
 set -u
 
-VERSION=2.0.0
+VERSION=2.1.0
 INSTALL_PATH=/usr/local/bin/update
 COMPOSE_DIRS=/etc/update/compose-dirs
 COMPOSE_PROJECTS=/etc/update/compose-projects
@@ -99,16 +99,18 @@ as_root() {
 
 usage() {
     cat <<'EOF'
-update - Unified Linux + Docker maintenance tool (v2.0.0)
+update - Unified Linux + Docker + SafeLine maintenance tool (v2.1.0)
 
 Usage:
   update                        Update OS + Flatpak/Snap/Brew; print local Docker inventory
   update --check                Read-only package check + remote Docker image digest audit
   update --docker-check         Remote Docker image audit only (no pull/recreate)
   update --docker-discover      Print discovered Compose projects, exact files and manager
+  update --safeline-check       Read-only SafeLine release check (official HTTPS feed)
+  update --safeline             Invoke OFFICIAL SafeLine updater after typed confirmation
   update --docker              Pull / preview / deploy *allowlisted* custom Compose projects
   update --docker --check      Same read-only audit as --docker-check
-  update --all                 OS updates + selected Compose deployment
+  update --all                 OS updates + selected Compose deployment (EXCLUDES SafeLine)
   update --yes                 Auto-confirm normal package manager prompts
   update --all --yes           Auto-confirm allowlisted CUSTOM Compose deployments
   update --protect-engine      Abort OS package stage when it may update a running Docker engine
@@ -118,7 +120,8 @@ Usage:
 Compose allowlist: /etc/update/compose-projects (one exact project name per line)
 Legacy v1 directory allowlist /etc/update/compose-dirs remains supported.
 Docker 1Panel / SafeLine / AzuraCast / known manager projects are never
-redeployed by this tool, even if allowlisted. Update those in their own manager.
+redeployed via Compose, even if allowlisted. Only --safeline explicitly invokes
+the OFFICIAL SafeLine manager. --yes NEVER authorizes WAF downtime.
 
 --check never pulls images, installs packages or recreates containers. Remote
 image check compares the SAME tag digest, NOT newer version numbers or releases.
@@ -165,12 +168,14 @@ while [ "$#" -gt 0 ]; do
         --check) CHECK=1 ;;
         --protect-engine) PROTECT_ENGINE=1 ;;
         -y|--yes) YES=1 ;;
-        --docker|--docker-check|--docker-discover|--all)
+        --docker|--docker-check|--docker-discover|--safeline|--safeline-check|--all)
             [ "$MODE" = normal ] || die 'Choose exactly one Docker mode.'
             case "$1" in
                 --docker) MODE=docker ;;
                 --docker-check) MODE=docker-check ;;
                 --docker-discover) MODE=docker-discover ;;
+                --safeline) MODE=safeline ;;
+                --safeline-check) MODE=safeline-check ;;
                 --all) MODE=all ;;
             esac ;;
         *) die "Unknown option: $1 (try --help)." ;;
@@ -182,6 +187,10 @@ if [ "$INSTALL" -eq 1 ]; then
     [ "$PROTECT_ENGINE" -eq 0 ] || die '--install cannot be combined with operations.'
     install_self
     exit 0
+fi
+if [ "$MODE" = safeline ] || [ "$MODE" = safeline-check ]; then
+    [ "$YES" -eq 0 ] && [ "$PROTECT_ENGINE" -eq 0 ] && [ "$CHECK" -eq 0 ] ||
+        die 'SafeLine modes require a separate explicit invocation; --yes cannot approve WAF downtime.'
 fi
 if [ "$MODE" = docker-check ] || [ "$MODE" = docker-discover ]; then
     [ "$YES" -eq 0 ] && [ "$PROTECT_ENGINE" -eq 0 ] ||
@@ -847,16 +856,23 @@ def audit_images(containers):
     image_ids = {c['image_id'] for c in containers}
     known = get_local_digests(image_ids)
     refs = {c['image_ref'] for c in containers if c['image_ref']}
-    # Skip remote requests without a valid matching local digest.
+    # Only query images that have a comparable local digest. Docker records
+    # docker.io/library/foo, library/foo and foo under different spellings.
+    # Earlier versions compared the raw string, incorrectly reducing 25 images
+    # to only 2 remote queries on some hosts.
     usable = set()
     for c in containers:
         ref = c['image_ref']
         repo = normalize_repo(ref)
         if c['image_id'] and ref and '@sha256:' not in ref:
-            if any(isinstance(d, str) and d.startswith(repo + '@sha256:') for d in known.get(c['image_id'], [])):
+            if any(isinstance(d, str) and '@sha256:' in d and
+                   normalize_repo(d.rsplit('@', 1)[0]) == repo
+                   for d in known.get(c['image_id'], [])):
                 usable.add(ref)
     remote = {}
     to_check = sorted(usable)[:MAX_REMOTE_IMAGES]
+    out('Comparable image tags: {} / {} unique references; {} lack matching local digests.'.format(
+        len(usable), len(refs), len(refs - usable)))
     if not shutil.which('docker'):
         warn('docker CLI not found; remote checks unavailable')
     elif not to_check:
@@ -961,6 +977,291 @@ docker_report_and_update() {
     docker_python "$action"
 }
 
+safeline_python() {
+    action=$1
+    python3 - "$action" "$DOCKER_AS_ROOT" "$DOCKER_WRAPPER" <<'__UPDATE_SAFELINE_PY__'
+# Embedded SafeLine adapter (Python 3 standard library only).
+# Read-only discovery/status; vendor scripts are executed only by shell after explicit confirmation.
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ACTION = sys.argv[1]  # local | remote | path | preflight
+DOCKER_AS_ROOT = sys.argv[2] == 'root'
+DOCKER_WRAPPER = sys.argv[3] if len(sys.argv) > 3 else 'sudo'
+DOCKER_CMD = ([DOCKER_WRAPPER, 'docker'] if DOCKER_AS_ROOT else ['docker'])
+VERSION_URL = 'https://waf-ce.chaitin.cn/release/latest/version.json'
+VERSION_PATTERN = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-lts)?$')
+
+
+def show(text):
+    print('[update/safeline] ' + text, flush=True)
+
+
+def warn(text):
+    print('[update/safeline] WARNING: ' + text, file=sys.stderr, flush=True)
+
+
+def docker(*args):
+    try:
+        p = subprocess.run(DOCKER_CMD + list(args), capture_output=True,
+                           text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError('Docker inquiry failed: {}'.format(str(exc)[:150]))
+    if p.returncode:
+        raise RuntimeError('Docker inquiry failed ({})'.format(' '.join(args[:3])))
+    return p.stdout
+
+
+def safe_env(path):
+    result = {}
+    try:
+        data = path.read_text(encoding='utf-8', errors='replace')
+    except (OSError, UnicodeError):
+        return None
+    for line in data.splitlines():
+        match = re.match(r'^\s*(SAFELINE_DIR|IMAGE_TAG|RELEASE|CHANNEL)\s*=\s*(.*?)\s*$', line)
+        if match:
+            v = match.group(2)
+            if len(v) > 1 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            result[match.group(1)] = v
+    return result
+
+
+def get_installation():
+    try:
+        entries = json.loads(docker('compose', 'ls', '--all', '--format', 'json'))
+    except (ValueError, TypeError):
+        raise RuntimeError('Cannot parse Compose project JSON')
+    if not isinstance(entries, list):
+        raise RuntimeError('Unexpected Docker Compose response')
+    matches = [p for p in entries if isinstance(p, dict) and p.get('Name') == 'safeline']
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError('Ambiguous SafeLine Compose project')
+    project = matches[0]
+    files = project.get('ConfigFiles', '')
+    if isinstance(files, str):
+        files = [p.strip() for p in files.split(',') if p.strip()]
+    if not isinstance(files, list) or not files or any(not isinstance(f, str) or not f.startswith('/') or '\n' in f for f in files):
+        raise RuntimeError('SafeLine Compose configuration paths are missing or invalid')
+    roots = {str(Path(f).resolve().parent) for f in files}
+    if len(roots) != 1:
+        raise RuntimeError('SafeLine Compose configuration spans multiple directories; manual upgrade needed')
+    folder = Path(next(iter(roots)))
+    if not folder.is_dir() or any(not Path(f).is_file() for f in files):
+        raise RuntimeError('SafeLine Compose files are missing; refusing automatic vendor upgrade')
+    return folder, project
+
+
+def current_image_version():
+    ids = docker('ps', '-a', '--filter', 'label=com.docker.compose.project=safeline',
+                 '--format', '{{.ID}}').splitlines()
+    if not ids:
+        raise RuntimeError('SafeLine project found, but no Compose containers are present')
+    try:
+        details = json.loads(docker('inspect', '--type', 'container', *ids))
+    except (ValueError, TypeError):
+        raise RuntimeError('Cannot parse SafeLine container metadata')
+    running = 0
+    mgt_image = ''
+    for c in details:
+        if (c.get('State') or {}).get('Status') == 'running':
+            running += 1
+        config = c.get('Config') or {}
+        labels = config.get('Labels') or {}
+        image = str(config.get('Image') or '')
+        if labels.get('com.docker.compose.service') == 'mgt' or re.search(r'(?:^|/)safeline-mgt(?:-g)?:', image):
+            mgt_image = image
+    match = re.search(r'(?:^|/)safeline-mgt(?:-g)?:v?(\d+\.\d+\.\d+)(?:-lts)?(?:$|@)', mgt_image)
+    version = match.group(1) if match else None
+    return version, mgt_image, running
+
+
+def semver(value):
+    m = VERSION_PATTERN.fullmatch(str(value or ''))
+    return tuple(map(int, m.groups())) if m else None
+
+
+def get_remote_version(lts):
+    request = urllib.request.Request(VERSION_URL, headers={'User-Agent': 'linux-update-safeline/2.1'})
+    try:
+        with urllib.request.urlopen(request, timeout=9) as response:
+            data = response.read(65537)
+            if len(data) > 65536:
+                raise ValueError('Version response exceeds limit')
+            obj = json.loads(data)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError, json.JSONDecodeError) as exc:
+        warn('Cannot verify official version over HTTPS: {}'.format(type(exc).__name__))
+        return None
+    if not isinstance(obj, dict):
+        return None
+    version = obj.get('lts_version' if lts else 'latest_version')
+    return version if semver(version) else None
+
+
+def main():
+    installation = get_installation()
+    if not installation:
+        if ACTION == 'path':
+            warn('SafeLine Compose project not detected. Refusing to run installer.')
+            return 2
+        show('SafeLine not detected; skipped.')
+        return 0
+    folder, project = installation
+    env = safe_env(folder / '.env')
+    current, image, running = current_image_version()
+    if ACTION == 'path':
+        if not running:
+            warn('SafeLine has no running containers; use the official manual recovery procedure')
+            return 2
+        if env is None:
+            warn('Cannot read SafeLine .env; run sudo update --safeline or check permissions')
+            return 2
+        declared = env.get('SAFELINE_DIR', '')
+        if declared and (not declared.startswith('/') or str(Path(declared).resolve()) != str(folder)):
+            warn('SAFELINE_DIR does not match the detected install directory; refusing upgrade')
+            return 2
+        if env.get('RELEASE', '').strip() or env.get('CHANNEL', '').strip().lower() in ('beta', 'lts'):
+            warn('Non-default SafeLine release/channel detected; use the channel-specific official updater')
+            return 2
+        if not current:
+            warn('Cannot reliably identify running management version; manual upgrade recommended')
+            return 2
+        print(str(folder))
+        return 0
+    if ACTION == 'preflight':
+        if env is None or not current or not semver(current):
+            warn('Cannot establish current SafeLine version; refusing automated handoff')
+            return 2
+        if env.get('RELEASE', '').strip() or env.get('CHANNEL', '').strip().lower() in ('beta', 'lts'):
+            warn('Non-standard SafeLine release detected; use channel-specific official instructions')
+            return 2
+        remote = get_remote_version(False)
+        if not remote:
+            warn('Cannot verify official latest version; do not blindly execute updater')
+            return 2
+        if semver(current) > semver(remote):
+            warn('Installed version is newer than official feed; refusing possible downgrade')
+            return 2
+        if semver(current) == semver(remote):
+            print('ALREADY_CURRENT')
+        else:
+            print('UPGRADE_TO=' + remote)
+        return 0
+    show('Installation: {} (project: safeline; {} running containers)'.format(folder, running))
+    show('Management image: {}'.format(image or '<unknown>'))
+    configured = env.get('IMAGE_TAG', '?') if env is not None else '<.env unreadable>'
+    show('Running version: {}; configured IMAGE_TAG: {}'.format(current or 'unknown', configured))
+    if env is not None and env.get('RELEASE'):
+        show('Release branch: {} (requires manual review)'.format(env['RELEASE']))
+    if ACTION == 'remote':
+        is_lts = bool(env and '-lts' in env.get('RELEASE', '').lower())
+        remote = get_remote_version(is_lts)
+        if remote is None:
+            show('Official release: UNKNOWN (no changes made)')
+        else:
+            show('Official {} release: {}'.format('LTS' if is_lts else 'stable', remote))
+            if current and semver(current):
+                local_version = semver(current)
+                official_version = semver(remote)
+                if local_version < official_version:
+                    show('UPDATE_AVAILABLE (check release notes before upgrading)')
+                elif local_version == official_version:
+                    show('VERSION_CURRENT (does not imply configuration/health is current)')
+                else:
+                    show('LOCAL_VERSION_NEWER (version feed/channel mismatch; do not downgrade)')
+            else:
+                show('VERSION_UNKNOWN (cannot compare versions)')
+    show('To upgrade explicitly: update --safeline (maintenance window, manual confirmation)')
+    return 0
+
+
+try:
+    sys.exit(main())
+except RuntimeError as error:
+    warn(str(error))
+    sys.exit(2)
+__UPDATE_SAFELINE_PY__
+}
+
+safeline_status() {
+    action=$1
+    have docker || { log 'SafeLine check skipped: Docker not installed.'; return 0; }
+    have python3 || { warn 'SafeLine check requires Python 3.'; return 1; }
+    get_docker_access || return 1
+    section SafeLine
+    safeline_python "$action"
+}
+
+safeline_upgrade() {
+    # This NEVER runs from 'update', '--all', '--docker', '--check' or '--yes'.
+    section 'SafeLine official upgrade'
+    have bash || { warn 'bash is required by the official SafeLine manager.'; return 1; }
+    have curl || { warn 'curl is required to fetch the official SafeLine manager.'; return 1; }
+    have python3 || { warn 'Python 3 is required for installation detection.'; return 1; }
+    get_docker_access || return 1
+    install_dir=$(safeline_python path) || return 1
+    [ -n "$install_dir" ] && [ -d "$install_dir" ] || { warn 'Invalid SafeLine installation directory.'; return 1; }
+    sf_ready=$(safeline_python preflight) || return 1
+    if [ "$sf_ready" = ALREADY_CURRENT ]; then
+        log 'SafeLine is already at the official latest stable version; no manager execution needed.'
+        return 0
+    fi
+    case "$sf_ready" in UPGRADE_TO=*) log "SafeLine ${sf_ready}" ;; *) warn 'Unsafe SafeLine preflight result.'; return 1 ;; esac
+    [ -t 0 ] || { warn 'Interactive terminal required. Over SSH, use ssh -tt host update --safeline.'; return 1; }
+    log "Detected SafeLine installation: $install_dir"
+    log 'Upstream manager: https://waf-ce.chaitin.cn/release/latest/manager.sh'
+    warn 'Upgrade restarts SafeLine, temporarily interrupts protected traffic, and may migrate data.'
+    warn 'Back up the WAF directory and database, review changelog, and check APISIX/cluster dependencies.'
+    safeline_python local || return 1
+    umask 077
+    sf_work=$(mktemp -d "${TMPDIR:-/tmp}/update-safeline.XXXXXXXX") || return 1
+    sf_script=$sf_work/manager.sh
+    # A separate subshell makes cleanup robust even on errors and signals.
+    (
+        trap 'rm -rf "$sf_work"' 0
+        trap 'exit 1' 1 2 3 15
+        log 'Downloading upstream manager with certificate verification (no curl -k)...'
+        curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 90 \
+            'https://waf-ce.chaitin.cn/release/latest/manager.sh' -o "$sf_script" || exit 1
+        [ -s "$sf_script" ] && bash -n "$sf_script" || {
+            warn 'Upstream script was empty or failed shell syntax validation.'; exit 1;
+        }
+        log "Manager SHA256: $(sha256sum "$sf_script" | awk '{print $1}')"
+        printf '[update/safeline] Type UPGRADE SAFELINE to accept service downtime: '
+        IFS= read -r confirmation || exit 1
+        [ "$confirmation" = 'UPGRADE SAFELINE' ] || {
+            warn 'SafeLine update cancelled; no vendor script executed.'; exit 1;
+        }
+        log 'Invoking official SafeLine manager from its original installation directory.'
+        (cd "$install_dir" && as_root bash "$sf_script") || {
+            warn 'Official SafeLine manager returned a failure. Check WAF health and manager logs.'; exit 1;
+        }
+        log 'Official manager completed. Checking local SafeLine service metadata...'
+        safeline_python local || exit 1
+    )
+}
+
+# SafeLine is a separate, intentionally non-automatable safety boundary.
+if [ "$MODE" = safeline-check ]; then
+    safeline_status remote || die 'SafeLine status inspection failed.'
+    log 'Finished.'
+    exit 0
+fi
+if [ "$MODE" = safeline ]; then
+    safeline_upgrade || die 'SafeLine official upgrade was cancelled or failed.'
+    log 'Finished.'
+    exit 0
+fi
+
 if [ "$MODE" != docker ] && [ "$MODE" != docker-check ] && [ "$MODE" != docker-discover ]; then
     if [ -f /etc/unraid-version ] || [ -f /etc/openwrt_release ]; then
         if [ "$CHECK" -eq 1 ]; then
@@ -992,6 +1293,11 @@ if [ "$MODE" = all ] && [ "$CHECK" -eq 0 ] && [ "$ERRORS" -ne 0 ]; then
     warn 'Skipping Docker deployment because an earlier update stage failed.'
 else
     docker_report_and_update || { warn 'Docker stage failed.'; ERRORS=$((ERRORS + 1)); }
+fi
+
+# Report SafeLine separately from generic Compose. Do not execute its updater by default.
+if have docker && have python3 && { [ "$MODE" = docker-check ] || [ "$CHECK" -eq 1 ]; }; then
+    safeline_status remote || warn 'SafeLine version inquiry failed (nonfatal).'
 fi
 
 if [ "$CHECK" -eq 0 ] && [ -f /var/run/reboot-required ]; then
