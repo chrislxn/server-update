@@ -6,13 +6,13 @@
 # only to place the checked payload into privileged directories.
 set -eu
 
-VERSION=2.1.0
+VERSION=2.2.0
 INSTALL_DIR=${UPDATE_INSTALL_DIR:-/usr/local/bin}
 CONFIG_DIR=${UPDATE_CONFIG_DIR:-/etc/update}
 DEST=$INSTALL_DIR/update
 ALLOWLIST=$CONFIG_DIR/compose-projects
 LEGACY_ALLOWLIST=$CONFIG_DIR/compose-dirs
-PAYLOAD_SHA256=bce2c32e138c863b314f0f4aba57ab2a9a16e7e52f86e27df48c2195af4d6b3b
+PAYLOAD_SHA256=23da3aef3585651597d1797c38963138638aec7cf626f7ec67464c1b61ca1df8
 STAGE=
 WORKDIR=
 
@@ -67,7 +67,7 @@ cat > "$PAYLOAD" <<'__UPDATE_PAYLOAD_75B3A1__'
 # Requires: POSIX /bin/sh. Does not reboot, prune Docker, or change OS releases.
 set -u
 
-VERSION=2.1.0
+VERSION=2.2.0
 INSTALL_PATH=/usr/local/bin/update
 COMPOSE_DIRS=/etc/update/compose-dirs
 COMPOSE_PROJECTS=/etc/update/compose-projects
@@ -99,7 +99,7 @@ as_root() {
 
 usage() {
     cat <<'EOF'
-update - Unified Linux + Docker + SafeLine maintenance tool (v2.1.0)
+update - Unified Linux + Docker + SafeLine maintenance tool (v2.2.0)
 
 Usage:
   update                        Update OS + Flatpak/Snap/Brew; print local Docker inventory
@@ -208,6 +208,18 @@ confirm() {
     case "$answer" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
+# Alibaba Cloud Linux 4 ships both RPM and Deb Edition images.
+# Require explicit Deb image metadata; never guess from locally present tools.
+alinux_is_deb_edition() {
+    case " ${ID_LIKE:-} " in
+        *' debian '*|*' ubuntu '*) return 0 ;;
+    esac
+    case "${PRETTY_NAME:-} ${VARIANT:-} ${VARIANT_ID:-}" in
+        *'Deb Edition'*|*'DEB Edition'*|*'deb edition'*|*'Adebe'*|*'adebe'*|*'ADeBe'*) return 0 ;;
+    esac
+    return 1
+}
+
 identify_os() {
     [ -r /etc/os-release ] || { warn '/etc/os-release unavailable'; return 1; }
     # os-release is a trusted OS-provided shell-compatible variables file.
@@ -217,8 +229,35 @@ identify_os() {
         FAMILY=ostree
         return 0
     fi
+    OS_VERSION=${VERSION_ID:-}
+    OS_MAJOR=${OS_VERSION%%.*}
     case "${ID:-}" in
-        debian|ubuntu|linuxmint|raspbian|pop|elementary|kali|devuan|neon|zorin)
+        # Alibaba Cloud Linux: v2 yum, v3 RPM/dnf, v4 RPM/dnf or Deb/apt.
+        alinux|aliyunlinux|aliyun)
+            case "$OS_MAJOR" in
+                2) FAMILY=yum ;;
+                3) FAMILY=dnf ;;
+                4) if alinux_is_deb_edition; then FAMILY=apt; else FAMILY=dnf; fi ;;
+                *) FAMILY=unsupported ;;
+            esac ;;
+        # TencentOS Server (also known as Tlinux): v2 yum; v3/v4 dnf.
+        tencentos|tlinux|tencentos-server|tencentosserver)
+            case "$OS_MAJOR" in
+                2) FAMILY=yum ;;
+                3|4) FAMILY=dnf ;;
+                *) FAMILY=unsupported ;;
+            esac ;;
+        # Anolis OS 7 is CentOS 7-compatible; Anolis 8/23 use dnf.
+        anolis|anolisos)
+            case "$OS_MAJOR" in
+                7) FAMILY=yum ;;
+                8|23) FAMILY=dnf ;;
+                *) FAMILY=unsupported ;;
+            esac ;;
+        # OpenCloudOS recommends dnf in preference to compatible yum.
+        opencloudos|opencloudos-stream)
+            FAMILY=dnf ;;
+        adebe|debian|ubuntu|linuxmint|raspbian|pop|elementary|kali|devuan|neon|zorin)
             FAMILY=apt ;;
         fedora|rhel|centos|rocky|almalinux|ol|amzn)
             FAMILY=dnf ;;
@@ -233,6 +272,16 @@ identify_os() {
         alpine)
             FAMILY=apk ;;
         *)
+            # Some TencentOS cloud images may use inherited CentOS IDs.
+            case "${NAME:-} ${PRETTY_NAME:-}" in
+                *'TencentOS Server'*)
+                    case "$OS_MAJOR" in
+                        2) FAMILY=yum ;;
+                        3|4) FAMILY=dnf ;;
+                        *) FAMILY=unsupported ;;
+                    esac
+                    return 0 ;;
+            esac
             case " ${ID_LIKE:-} " in
                 *' debian '*|*' ubuntu '*) FAMILY=apt ;;
                 *' fedora '*|*' rhel '*) FAMILY=dnf ;;
@@ -242,6 +291,15 @@ identify_os() {
             esac ;;
     esac
     return 0
+}
+
+# Legacy RHEL/CentOS 7-era vendor distros should prefer the vendor's yum CLI.
+choose_yum() {
+    if have yum; then PKG=yum
+    else
+        warn 'YUM not found for this OS release; refusing to guess another package manager.'
+        return 1
+    fi
 }
 
 choose_dnf() {
@@ -284,6 +342,17 @@ system_packages() {
                 else
                     as_root apt-get upgrade || return 1
                 fi
+            fi ;;
+        yum)
+            choose_yum || return 1
+            if [ "$CHECK" -eq 1 ]; then
+                "$PKG" check-update
+                status=$?
+                [ "$status" -eq 0 ] || [ "$status" -eq 100 ] || return "$status"
+            elif [ "$YES" -eq 1 ]; then
+                as_root "$PKG" -y update || return 1
+            else
+                as_root "$PKG" update || return 1
             fi ;;
         dnf)
             choose_dnf || return 1
@@ -979,7 +1048,22 @@ docker_report_and_update() {
 
 safeline_python() {
     action=$1
-    python3 - "$action" "$DOCKER_AS_ROOT" "$DOCKER_WRAPPER" <<'__UPDATE_SAFELINE_PY__'
+    expected=${2:-}
+    # Status and verification need only Docker metadata, so never request
+    # sudo to inspect an already-running SafeLine instance. The vendor upgrade
+    # preflight, however, must verify protected files and .env as root.
+    if [ "$action" = path ] || [ "$action" = preflight ]; then
+        set -- python3 - "$action" direct "$DOCKER_WRAPPER" "$expected"
+        if [ "$(id -u)" -ne 0 ]; then
+            if have sudo; then set -- sudo "$@"
+            elif have doas; then set -- doas "$@"
+            else warn 'sudo/doas required for protected SafeLine upgrade configuration'; return 1
+            fi
+        fi
+    else
+        set -- python3 - "$action" "$DOCKER_AS_ROOT" "$DOCKER_WRAPPER" "$expected"
+    fi
+    "$@" <<'__UPDATE_SAFELINE_PY__'
 # Embedded SafeLine adapter (Python 3 standard library only).
 # Read-only discovery/status; vendor scripts are executed only by shell after explicit confirmation.
 import json
@@ -991,9 +1075,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACTION = sys.argv[1]  # local | remote | path | preflight
+ACTION = sys.argv[1]  # local | remote | path | preflight | verify
 DOCKER_AS_ROOT = sys.argv[2] == 'root'
 DOCKER_WRAPPER = sys.argv[3] if len(sys.argv) > 3 else 'sudo'
+EXPECTED_VERSION = sys.argv[4] if len(sys.argv) > 4 else ''
 DOCKER_CMD = ([DOCKER_WRAPPER, 'docker'] if DOCKER_AS_ROOT else ['docker'])
 VERSION_URL = 'https://waf-ce.chaitin.cn/release/latest/version.json'
 VERSION_PATTERN = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-lts)?$')
@@ -1052,12 +1137,22 @@ def get_installation():
         files = [p.strip() for p in files.split(',') if p.strip()]
     if not isinstance(files, list) or not files or any(not isinstance(f, str) or not f.startswith('/') or '\n' in f for f in files):
         raise RuntimeError('SafeLine Compose configuration paths are missing or invalid')
-    roots = {str(Path(f).resolve().parent) for f in files}
+    # Read-only checks must not stat() or resolve() a private Compose file.
+    # Docker already reports the exact file paths; walking /data/safeline can
+    # raise PermissionError for members of the docker group who are not root.
+    roots = {os.path.normpath(os.path.dirname(f)) for f in files}
     if len(roots) != 1:
         raise RuntimeError('SafeLine Compose configuration spans multiple directories; manual upgrade needed')
     folder = Path(next(iter(roots)))
-    if not folder.is_dir() or any(not Path(f).is_file() for f in files):
-        raise RuntimeError('SafeLine Compose files are missing; refusing automatic vendor upgrade')
+    # File verification is required for launching the vendor updater, but NOT
+    # for an unprivileged read-only version check (or its postflight check).
+    if ACTION in ('path', 'preflight'):
+        try:
+            files_exist = folder.is_dir() and all(Path(f).is_file() for f in files)
+        except OSError:
+            raise RuntimeError('Cannot access SafeLine Compose files; run with sudo')
+        if not files_exist:
+            raise RuntimeError('SafeLine Compose files are missing; refusing automatic vendor upgrade')
     return folder, project
 
 
@@ -1126,7 +1221,7 @@ def main():
             warn('Cannot read SafeLine .env; run sudo update --safeline or check permissions')
             return 2
         declared = env.get('SAFELINE_DIR', '')
-        if declared and (not declared.startswith('/') or str(Path(declared).resolve()) != str(folder)):
+        if declared and (not declared.startswith('/') or str(Path(declared).resolve()) != str(folder.resolve())):
             warn('SAFELINE_DIR does not match the detected install directory; refusing upgrade')
             return 2
         if env.get('RELEASE', '').strip() or env.get('CHANNEL', '').strip().lower() in ('beta', 'lts'):
@@ -1156,31 +1251,41 @@ def main():
         else:
             print('UPGRADE_TO=' + remote)
         return 0
-    show('Installation: {} (project: safeline; {} running containers)'.format(folder, running))
-    show('Management image: {}'.format(image or '<unknown>'))
-    configured = env.get('IMAGE_TAG', '?') if env is not None else '<.env unreadable>'
-    show('Running version: {}; configured IMAGE_TAG: {}'.format(current or 'unknown', configured))
-    if env is not None and env.get('RELEASE'):
-        show('Release branch: {} (requires manual review)'.format(env['RELEASE']))
+    if ACTION == 'verify':
+        # This deliberately uses only Docker metadata. It must not turn an
+        # already successful vendor upgrade into a false failure merely because
+        # the invoking user cannot stat /data/safeline/docker-compose.yaml.
+        if not running or not current:
+            warn('Postflight could not identify a running SafeLine manager')
+            return 2
+        if EXPECTED_VERSION and semver(current) != semver(EXPECTED_VERSION):
+            warn('Postflight version mismatch: running {}, expected {}'.format(current, EXPECTED_VERSION))
+            return 2
+        show('upgrade verified: running {} ({} containers running)'.format(current, running))
+        return 0
+    if ACTION == 'local':
+        show('running {} ({} containers running)'.format(current or 'unknown', running))
+        return 0
     if ACTION == 'remote':
-        is_lts = bool(env and '-lts' in env.get('RELEASE', '').lower())
+        # When .env is unreadable, the image name can still indicate LTS.
+        is_lts = bool((env and '-lts' in env.get('RELEASE', '').lower()) or
+                      '-lts' in (image or '').lower())
         remote = get_remote_version(is_lts)
         if remote is None:
-            show('Official release: UNKNOWN (no changes made)')
+            show('version unknown (running: {}; official feed unavailable)'.format(current or 'unknown'))
         else:
-            show('Official {} release: {}'.format('LTS' if is_lts else 'stable', remote))
             if current and semver(current):
                 local_version = semver(current)
                 official_version = semver(remote)
                 if local_version < official_version:
-                    show('UPDATE_AVAILABLE (check release notes before upgrading)')
+                    show('update available: {} -> {}'.format(current, remote))
+                    show('Run update --safeline after reviewing release notes and scheduling downtime.')
                 elif local_version == official_version:
-                    show('VERSION_CURRENT (does not imply configuration/health is current)')
+                    show('up to date ({})'.format(current))
                 else:
-                    show('LOCAL_VERSION_NEWER (version feed/channel mismatch; do not downgrade)')
+                    show('local version newer than official feed: {} > {} (check channel)'.format(current, remote))
             else:
-                show('VERSION_UNKNOWN (cannot compare versions)')
-    show('To upgrade explicitly: update --safeline (maintenance window, manual confirmation)')
+                show('version unknown (running: {}; official: {})'.format(current or 'unknown', remote))
     return 0
 
 
@@ -1188,6 +1293,9 @@ try:
     sys.exit(main())
 except RuntimeError as error:
     warn(str(error))
+    sys.exit(2)
+except (OSError, PermissionError) as error:
+    warn('SafeLine metadata access denied/unavailable: {}'.format(type(error).__name__))
     sys.exit(2)
 __UPDATE_SAFELINE_PY__
 }
@@ -1209,7 +1317,8 @@ safeline_upgrade() {
     have python3 || { warn 'Python 3 is required for installation detection.'; return 1; }
     get_docker_access || return 1
     install_dir=$(safeline_python path) || return 1
-    [ -n "$install_dir" ] && [ -d "$install_dir" ] || { warn 'Invalid SafeLine installation directory.'; return 1; }
+    # The privileged `path` action already verifies the directory and files.
+    [ -n "$install_dir" ] || { warn 'Invalid SafeLine installation directory.'; return 1; }
     sf_ready=$(safeline_python preflight) || return 1
     if [ "$sf_ready" = ALREADY_CURRENT ]; then
         log 'SafeLine is already at the official latest stable version; no manager execution needed.'
@@ -1242,11 +1351,16 @@ safeline_upgrade() {
             warn 'SafeLine update cancelled; no vendor script executed.'; exit 1;
         }
         log 'Invoking official SafeLine manager from its original installation directory.'
-        (cd "$install_dir" && as_root bash "$sf_script") || {
+        as_root sh -c 'cd "$1" && exec bash "$2"' safeline-updater "$install_dir" "$sf_script" || {
             warn 'Official SafeLine manager returned a failure. Check WAF health and manager logs.'; exit 1;
         }
         log 'Official manager completed. Checking local SafeLine service metadata...'
-        safeline_python local || exit 1
+        expected=${sf_ready#UPGRADE_TO=}
+        if ! safeline_python verify "$expected"; then
+            warn 'Official manager finished, but post-upgrade verification is inconclusive.'
+            warn 'Do NOT retry blindly; inspect running containers and WAF health.'
+            exit 3
+        fi
     )
 }
 
@@ -1257,7 +1371,13 @@ if [ "$MODE" = safeline-check ]; then
     exit 0
 fi
 if [ "$MODE" = safeline ]; then
-    safeline_upgrade || die 'SafeLine official upgrade was cancelled or failed.'
+    safeline_upgrade
+    safeline_result=$?
+    case "$safeline_result" in
+        0) ;;
+        3) die 'SafeLine updater completed; post-upgrade verification needs manual review (not an upgrade failure).' ;;
+        *) die 'SafeLine upgrade was not confirmed completed; review manager logs before retrying.' ;;
+    esac
     log 'Finished.'
     exit 0
 fi
